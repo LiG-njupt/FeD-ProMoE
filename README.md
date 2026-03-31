@@ -22,7 +22,7 @@ CUDA	Compatible with NVIDIA GeForce GTX 5060 GPU
 Other Dependencies	numpy, scipy, librosa, matplotlib
 
 📊 Dataset
-We validate our method on the DroneRFa dataset, which contains I/Q RF signals collected from 8 outdoor flying UAVs.
+We validate our method on the DroneRFa dataset——DroneRFa: A large-scale dataset of drone radio frequency signals for detecting low-altitude drones, which contains I/Q RF signals collected from 8 outdoor flying UAVs.
 Sampling rate: 100 MS/s
 Center frequency: 2440 MHz
 Input format: STFT spectrogram (244 × 244 single-channel)
