@@ -1,160 +1,71 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Variable
-from collections import OrderedDict
-from torch.nn import init
-import math
-from thop import profile
-from thop import clever_format
-from ptflops import get_model_complexity_info
+import argparse
+import os
 
 
-def conv_bn(inp, oup, stride):
-    return nn.Sequential(
-        nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
-        nn.BatchNorm2d(oup),
-        nn.ReLU(inplace=True)
-    )
+def args_parser():
+    parser = argparse.ArgumentParser(description="UAV MoE-FL (Plan B: Phase 0 + 1.5 with Mixup)")
 
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--save_dir", type=str, default="./runs/uav_moe_mixup")
 
-def conv_1x1_bn(inp, oup):
-    return nn.Sequential(
-        nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
-        nn.BatchNorm2d(oup),
-        nn.ReLU(inplace=True)
-    )
+    parser.add_argument("--data_root", type=str, default="./")
+    parser.add_argument("--train_dir", type=str, default="train_Power_Normalization")
+    parser.add_argument("--test_dir", type=str, default="test_Power_Normalization")
 
+    parser.add_argument("--dis_list", type=str, nargs="+", default=["D00", "D01", "D10"])
 
-def channel_shuffle(x, groups):
-    batchsize, num_channels, height, width = x.data.size()
-    channels_per_group = num_channels // groups
+    parser.add_argument("--num_locs", type=int, default=8)
+    parser.add_argument("--num_classes", type=int, default=8)
 
-    x = x.view(batchsize, groups, channels_per_group, height, width)
-    x = torch.transpose(x, 1, 2).contiguous()
-    x = x.view(batchsize, -1, height, width)
-    return x
+    parser.add_argument("--local_ep", type=int, default=10)
+    parser.add_argument("--local_bs", type=int, default=32)
+    parser.add_argument("--bs", type=int, default=128)
 
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight_decay", type=float, default=5e-4)
 
-class InvertedResidual(nn.Module):
-    def __init__(self, inp, oup, stride, benchmodel):
-        super().__init__()
-        self.benchmodel = benchmodel
-        self.stride = stride
-        assert stride in [1, 2]
+    parser.add_argument("--moe_num_experts", type=int, default=8)
 
-        oup_inc = oup // 2
+    parser.add_argument("--proxy_per_client", type=int, default=200)
+    parser.add_argument("--proxy_mixup_alpha", type=float, default=0.05)
+    parser.add_argument("--mutual_learn_epochs", type=int, default=80)
+    parser.add_argument("--mutual_learn_lr", type=float, default=2e-3)
+    parser.add_argument("--neg_per_expert_max", type=int, default=1400)
 
-        if self.benchmodel == 1:
-            self.banch2 = nn.Sequential(
-                nn.Conv2d(oup_inc, oup_inc, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(oup_inc, oup_inc, 3, stride, 1, groups=oup_inc, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.Conv2d(oup_inc, oup_inc, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.ReLU(inplace=True),
-            )
-        else:
-            self.banch1 = nn.Sequential(
-                nn.Conv2d(inp, inp, 3, stride, 1, groups=inp, bias=False),
-                nn.BatchNorm2d(inp),
-                nn.Conv2d(inp, oup_inc, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.ReLU(inplace=True),
-            )
-            self.banch2 = nn.Sequential(
-                nn.Conv2d(inp, oup_inc, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(oup_inc, oup_inc, 3, stride, 1, groups=oup_inc, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.Conv2d(oup_inc, oup_inc, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup_inc),
-                nn.ReLU(inplace=True),
-            )
+    parser.add_argument("--mixup_alpha", type=float, default=0.4)
 
-    @staticmethod
-    def _concat(x, out):
-        return torch.cat((x, out), 1)
+    parser.add_argument("--mutual_kd_epochs", type=int, default=5)
+    parser.add_argument("--mutual_kd_lr", type=float, default=1e-4)
+    parser.add_argument("--mutual_kd_alpha", type=float, default=0.1)
 
-    def forward(self, x):
-        if 1 == self.benchmodel:
-            x1 = x[:, :(x.shape[1] // 2), :, :]
-            x2 = x[:, (x.shape[1] // 2):, :, :]
-            out = self._concat(x1, self.banch2(x2))
-        elif 2 == self.benchmodel:
-            out = self._concat(self.banch1(x), self.banch2(x))
+    parser.add_argument("--proxy_bs", type=int, default=128)
+    parser.add_argument("--gate_cloud_epochs", type=int, default=24)
+    parser.add_argument("--kd_lr", type=float, default=2e-3)
+    parser.add_argument("--gate_sup_lambda", type=float, default=0.03)
 
-        return channel_shuffle(out, 2)
+    parser.add_argument("--hybrid_mode", type=str, default="cloud_gate_top2", choices=["local_only", "cloud_gate_top2", "cloud_ensemble"])
+    parser.add_argument("--hybrid_alpha", type=float, default=1.0)
+    parser.add_argument("--hybrid_conf_th", type=float, default=0.8)
 
+    parser.add_argument("--frac", type=float, default=1.0)
+    parser.add_argument("--hard_rounds", type=int, default=1)
+    parser.add_argument("--cloud_kd_epochs", type=int, default=0)
+    parser.add_argument("--proxy_batches", type=int, default=0)
+    parser.add_argument("--kd_T", type=float, default=2.0)
+    parser.add_argument("--cloud_kd_div", type=float, default=0.0)
+    parser.add_argument("--route_tau", type=float, default=1.0)
+    parser.add_argument("--route_eps", type=float, default=0.0)
+    parser.add_argument("--moe_kd_weight", type=float, default=0.0)
+    parser.add_argument("--moe_kd_T", type=float, default=2.0)
+    parser.add_argument("--moe_kd_pair", type=float, default=0.0)
+    parser.add_argument("--moe_kd_div", type=float, default=0.0)
+    parser.add_argument("--moe_kd_topk", type=int, default=0)
+    parser.add_argument("--mutual_learn_alpha", type=float, default=1.0)
+    parser.add_argument("--mutual_learn_T", type=float, default=2.0)
 
-class ShuffleNetV2(nn.Module):
-    def __init__(self, n_class=6, input_size=244, width_mult=0.5):
-        super().__init__()
-        self.stage_repeats = [4, 8, 4]
-
-        if width_mult == 0.5:
-            self.stage_out_channels = [-1, 24, 48, 96, 192, 1024]
-        elif width_mult == 1.0:
-            self.stage_out_channels = [-1, 24, 116, 232, 464, 1024]
-        elif width_mult == 1.5:
-            self.stage_out_channels = [-1, 24, 176, 352, 704, 1024]
-        elif width_mult == 2.0:
-            self.stage_out_channels = [-1, 24, 224, 488, 976, 2048]
-
-        input_channel = self.stage_out_channels[1]
-        self.conv1 = conv_bn(1, input_channel, 2)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        self.features = []
-        for idxstage in range(len(self.stage_repeats)):
-            numrepeat = self.stage_repeats[idxstage]
-            output_channel = self.stage_out_channels[idxstage + 2]
-            for i in range(numrepeat):
-                if i == 0:
-                    self.features.append(InvertedResidual(input_channel, output_channel, 2, 2))
-                else:
-                    self.features.append(InvertedResidual(input_channel, output_channel, 1, 1))
-                input_channel = output_channel
-        self.features = nn.Sequential(*self.features)
-
-        self.conv_last = conv_1x1_bn(input_channel, self.stage_out_channels[-1])
-        self.globalpool = nn.Sequential(nn.AvgPool2d(int(input_size / 32)))
-
-        self.classifier = nn.Sequential(nn.Linear(self.stage_out_channels[-1], n_class))
-
-        self.output_size = n_class
-
-    def forward(self, x, return_features=False):
-        x = self.conv1(x)
-        x = self.maxpool(x)
-        x = self.features(x)
-        x = self.conv_last(x)
-        x = self.globalpool(x)
-
-        x = x.view(x.size(0), -1)
-
-        feature = x
-        x = self.classifier(x)
-
-        if return_features:
-            return x, feature
-        else:
-            return x
-
-
-if __name__ == "__main__":
-    model = ShuffleNetV2()
-    input = torch.randn(1, 1, 244, 244)
-    output = model(input)
-    print(model)
-
-    macs, params = get_model_complexity_info(model, (1, 244, 244), as_strings=True, print_per_layer_stat=True)
-    print(f"模型 FLOPs: {macs}")
-    print(f"模型参数量: {params}")
-
-    MACs, params = profile(model, inputs=(input,))
-    MACs, params = clever_format([MACs, params], '%.3f')
-    print(f"运算量：{MACs}, 参数量：{params}")
+    args = parser.parse_args()
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir, exist_ok=True)
+    return args
